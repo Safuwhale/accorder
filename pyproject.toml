@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "accorder"
+version = "0.1.0"
+description = "A CLI tool that scrapes grant/funding portals, extracts structured data via a hybrid deterministic + LLM pipeline, validates it, and tracks changes over time."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    # CLI
+    "typer>=0.12",
+    "rich>=13.0",
+
+    # Validation / schemas
+    "pydantic>=2.6",
+    "python-dateutil>=2.9",
+
+    # Extraction
+    "playwright>=1.44",
+    "trafilatura>=1.8",
+
+    # Hybrid AI extraction
+    "openai>=1.30",          # OpenRouter is OpenAI-API-compatible; used with a custom base_url
+    "tenacity>=8.2",
+
+    # Storage
+    "sqlalchemy>=2.0",
+
+    # Dedup
+    "rapidfuzz>=3.6",
+
+    # Delivery (optional HTML report)
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+accorder = "accorder.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["accorder*"]
