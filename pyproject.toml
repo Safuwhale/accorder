@@ -22,6 +22,8 @@ dependencies = [
     # Extraction
     "playwright>=1.44",
     "trafilatura>=1.8",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
 
     # Hybrid AI extraction
     "openai>=1.30",          # OpenRouter is OpenAI-API-compatible; used with a custom base_url
