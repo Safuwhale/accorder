@@ -34,10 +34,16 @@ DEFAULT_MODEL = os.environ.get("ACCORDER_LLM_MODEL", "anthropic/claude-3.5-sonne
 SYSTEM_PROMPT = """You are a data extraction assistant. Given the text content of a grant/funding opportunity webpage, extract ONLY the following fields as strict JSON, with no preamble, no markdown formatting, no explanation -- just the raw JSON object:
 
 {
-  "funder_name": string or null,        // the organization actually offering the money -- NOT the website hosting the listing
+  "funder_name": string or null,        // the organization actually offering the money -- NOT the website hosting the listing, and NOT the name of the specific programme/initiative/prize if that programme is run BY a larger parent organization. If the page describes a named programme (e.g. "the XYZ Fellowship") operated by a parent org (e.g. "run by the ABC Institute"), use the parent organization's name, not the programme's name. Only use the programme's own name if no separate parent organization is mentioned anywhere in the text.
   "application_url": string or null,    // the URL to apply directly, ONLY if explicitly present as a link in the text -- otherwise null
-  "eligibility_summary": string or null // 1-2 sentence summary of who can apply, or null if not stated
+  "eligibility_summary": string or null, // 1-2 sentence summary of who can apply, or null if not stated
+  "max_amount_raw": string or null,     // the maximum or only funding amount stated, exactly as written (e.g. "$50,000", "up to USD 25,000") -- do not do any math or convert currency, just copy the amount text as it appears
+  "min_amount_raw": string or null,     // the minimum funding amount, ONLY if the page states a range (e.g. "$5,000 to $50,000") -- otherwise null. Do not invent a minimum if only one figure is given.
+  "currency_raw": string or null,       // the currency of the amount(s) above, as stated or implied (e.g. "USD", "GBP", "EUR") -- null if no amount was found
+  "funding_type_raw": string or null    // the type of funding in the page's own words (e.g. "grant", "fellowship", "prize", "loan", "in-kind support") -- null if not stated
 }
+
+Example: if the page describes "the TaDA Residency Programme, run by the Textile and Design Alliance", funder_name is "Textile and Design Alliance", not "TaDA Residency Programme".
 
 If a field cannot be determined from the text, use null. Do not guess or invent values."""
 
@@ -47,11 +53,20 @@ If a field cannot be determined from the text, use null. Do not guess or invent 
 # ---------------------------------------------------------------------------
 
 def build_user_prompt(grant_name: str, page_text: str) -> str:
-    # Detail pages can be long (related posts, footer links, etc. that
-    # trafilatura doesn't always fully strip) -- cap what we send both to
-    # control cost and to keep the model focused on the actual grant content
-    # near the top of the page rather than trailing boilerplate.
-    trimmed = page_text[:6000]
+    # Detail pages can be long -- and on this source specifically, long is
+    # the norm, not the exception. fundsforNGOs posts are thorough SEO-style
+    # writeups (Program Objectives, Eligibility, Research Priority Areas,
+    # How to Apply, FAQs, Conclusion...), and the actual application link
+    # -- when present -- is almost always in the closing section, not near
+    # the top. The original 6000-char cap cut articles off well before that
+    # point on longer posts, meaning application_url couldn't be found even
+    # when the link genuinely existed on the page (confirmed against a real
+    # live page during testing: the apply link was the literal last line of
+    # a ~20,000-character article). 20,000 chars covers the full body of
+    # all but the longest outlier posts, and at Haiku-tier pricing the cost
+    # difference is negligible -- not worth being clever about extracting
+    # "just the relevant section" when simply raising the cap covers it.
+    trimmed = page_text[:20_000]
     return f"Grant title: {grant_name}\n\nPage content:\n{trimmed}"
 
 
@@ -81,7 +96,15 @@ def parse_llm_response(raw_response: str) -> dict:
     if not isinstance(data, dict):
         raise LLMMalformedResponseError(f"LLM response was valid JSON but not an object: {type(data).__name__}")
 
-    expected_keys = {"funder_name", "application_url", "eligibility_summary"}
+    expected_keys = {
+        "funder_name",
+        "application_url",
+        "eligibility_summary",
+        "max_amount_raw",
+        "min_amount_raw",
+        "currency_raw",
+        "funding_type_raw",
+    }
     missing = expected_keys - set(data.keys())
     if missing:
         raise LLMMalformedResponseError(f"LLM response missing expected keys: {missing}")
@@ -124,7 +147,18 @@ def call_llm(client, grant_name: str, page_text: str, model: str = DEFAULT_MODEL
 async def fetch_detail_page_text(page: Page, url: str) -> str:
     """Fetches a grant's detail page and strips it to readable text via
     trafilatura -- same "don't hand the LLM raw HTML" principle as Layer 2,
-    applied here to control token cost on detail pages too."""
+    applied here to control token cost on detail pages too.
+
+    output_format="markdown" + include_links=True matters: trafilatura's
+    plain-text default DROPS hyperlinks entirely, keeping only the anchor
+    text (e.g. "Apply Here" survives, the actual href does not). Since the
+    whole point of this fetch is finding the real application URL, that
+    default silently made application_url unfindable no matter how good
+    the prompt was -- confirmed in practice: every enriched grant's
+    application_url came back identical to the fundsforNGOs listing URL,
+    because no real URL ever reached the LLM. Markdown output preserves
+    links as [text](url), which the LLM can actually read from.
+    """
     import trafilatura
 
     await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -136,7 +170,7 @@ async def fetch_detail_page_text(page: Page, url: str) -> str:
         logger.warning(f"No <article> appeared within timeout for detail page {url}")
 
     html = await page.content()
-    return trafilatura.extract(html) or ""
+    return trafilatura.extract(html, output_format="markdown", include_links=True) or ""
 
 
 async def enrich_one_grant(page: Page, client, grant_name: str, detail_url: str, model: str = DEFAULT_MODEL) -> Optional[dict]:
@@ -162,23 +196,49 @@ async def enrich_one_grant(page: Page, client, grant_name: str, detail_url: str,
 
 if __name__ == "__main__":
     # 1. Clean, well-formed response
-    clean = '{"funder_name": "Global Climbing Initiative", "application_url": "https://example.org/apply", "eligibility_summary": "Open to registered NGOs."}'
+    clean = json.dumps({
+        "funder_name": "Global Climbing Initiative",
+        "application_url": "https://example.org/apply",
+        "eligibility_summary": "Open to registered NGOs.",
+        "max_amount_raw": "$50,000",
+        "min_amount_raw": None,
+        "currency_raw": "USD",
+        "funding_type_raw": "grant",
+    })
     result = parse_llm_response(clean)
     assert result["funder_name"] == "Global Climbing Initiative"
     assert result["application_url"] == "https://example.org/apply"
+    assert result["max_amount_raw"] == "$50,000"
+    assert result["currency_raw"] == "USD"
     print("Clean JSON response: parsed correctly.")
 
     # 2. Response wrapped in markdown fences (a common model habit despite instructions)
-    fenced = '```json\n{"funder_name": "Test Fund", "application_url": null, "eligibility_summary": null}\n```'
+    fenced = "```json\n" + json.dumps({
+        "funder_name": "Test Fund",
+        "application_url": None,
+        "eligibility_summary": None,
+        "max_amount_raw": None,
+        "min_amount_raw": None,
+        "currency_raw": None,
+        "funding_type_raw": None,
+    }) + "\n```"
     result = parse_llm_response(fenced)
     assert result["funder_name"] == "Test Fund"
     assert result["application_url"] is None
     print("Markdown-fenced JSON: stripped and parsed correctly.")
 
     # 3. All-null response (model genuinely couldn't determine anything -- valid, not an error)
-    all_null = '{"funder_name": null, "application_url": null, "eligibility_summary": null}'
+    all_null = json.dumps({
+        "funder_name": None,
+        "application_url": None,
+        "eligibility_summary": None,
+        "max_amount_raw": None,
+        "min_amount_raw": None,
+        "currency_raw": None,
+        "funding_type_raw": None,
+    })
     result = parse_llm_response(all_null)
-    assert result == {"funder_name": None, "application_url": None, "eligibility_summary": None}
+    assert all(v is None for v in result.values())
     print("All-null response: correctly treated as valid, not an error.")
 
     # 4. Malformed JSON -- should raise LLMMalformedResponseError, not crash with a raw JSONDecodeError
@@ -197,9 +257,9 @@ if __name__ == "__main__":
         print("Incomplete JSON (missing keys): correctly raised LLMMalformedResponseError.")
 
     # 6. Prompt builder truncates long page text rather than sending it all
-    long_text = "x" * 10_000
+    long_text = "x" * 30_000
     prompt = build_user_prompt("Test Grant", long_text)
-    assert len(prompt) < 7000, "prompt should be truncated, not send the full 10,000 chars"
+    assert len(prompt) < 21_000, "prompt should be truncated at ~20,000 chars, not send the full 30,000"
     print("Long page text: correctly truncated in the prompt.")
 
     print("\nSmoke test passed (pure logic only — call_llm/fetch_detail_page_text untested here, no network access).")
@@ -253,27 +313,44 @@ if __name__ == "__main__":
         fake_html = """
         <html><body><article>
           <h1>Community Benefit Fund: Gambling Research Grant Program</h1>
-          <p>Offered by the Australian Institute for Social Research. Apply at
-          https://aisr.example.org/apply/gambling-research-2026. Open to registered
-          nonprofits and university research groups in Australia.</p>
+          <p>Offered by the Australian Institute for Social Research.
+          <a href="https://aisr.example.org/apply/gambling-research-2026">Apply here</a>.
+          Open to registered nonprofits and university research groups in Australia.</p>
         </article></body></html>
         """
         llm_output = json.dumps({
             "funder_name": "Australian Institute for Social Research",
             "application_url": "https://aisr.example.org/apply/gambling-research-2026",
             "eligibility_summary": "Open to registered nonprofits and university research groups in Australia.",
+            "max_amount_raw": "AUD 80,000",
+            "min_amount_raw": None,
+            "currency_raw": "AUD",
+            "funding_type_raw": "research grant",
         })
 
         page = _FakePage(fake_html)
         client = _FakeClient([llm_output])
+
+        # Direct check on the fix itself: does fetch_detail_page_text() actually
+        # surface the URL from the <a href> now, instead of silently dropping it?
+        extracted_text = await fetch_detail_page_text(page, "https://example.org/detail-page")
+        assert "aisr.example.org/apply/gambling-research-2026" in extracted_text, (
+            f"application URL missing from extracted text -- trafilatura link "
+            f"preservation isn't working. Got: {extracted_text!r}"
+        )
+        print("fetch_detail_page_text() preserves hyperlinks (include_links=True fix): passed")
+
         result = await enrich_one_grant(page, client, "Community Benefit Fund", "https://example.org/detail-page")
 
         assert result is not None, "expected a result dict, got None"
         assert result["funder_name"] == "Australian Institute for Social Research"
         assert result["application_url"] == "https://aisr.example.org/apply/gambling-research-2026"
+        assert result["max_amount_raw"] == "AUD 80,000"
+        assert result["funding_type_raw"] == "research grant"
         print("enrich_one_grant() (success case): passed")
         print(f"  funder_name: {result['funder_name']}")
         print(f"  application_url: {result['application_url']}")
+        print(f"  max_amount_raw: {result['max_amount_raw']}, currency_raw: {result['currency_raw']}")
 
         # A page fetch that fails entirely should return None, not raise --
         # enrichment is best-effort, one bad detail page can't crash a batch.
@@ -288,3 +365,4 @@ if __name__ == "__main__":
 
     asyncio.run(run_enrich_test())
     print("\nFull enrich_one_grant() smoke test passed (fake page + fake client — real Playwright/OpenRouter untested here).")
+    

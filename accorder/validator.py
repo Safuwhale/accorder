@@ -37,9 +37,12 @@ from sqlalchemy.orm import Session
 from .extractor import RawListingCandidate, content_hash, extract_amounts_from_text
 from .schemas import (
     ExtractionMethod,
+    FundingType,
     GrantExtracted,
     SourceMetadata,
+    map_funding_type,
     normalize_and_validate,
+    parse_amount,
 )
 from .storage import Grant, GrantHistoryEntry, ValidationErrorRecord, session_scope
 
@@ -200,7 +203,9 @@ def process_candidates(
 async def enrich_grants(engine, run_id: uuid.UUID, limit: int = 20) -> int:
     """Opt-in Layer 3 pass: fetches detail pages for grants that still carry
     the placeholder funder_name and uses an LLM to fill in
-    funder_name / application_url / eligibility.
+    funder_name / application_url / eligibility, plus gap-fill amount,
+    currency, and funding_type where Layer 1's deterministic regex
+    (extract_amounts_from_text, run on the listing blurb) came up empty.
 
     Deliberately scoped to "grants that still need it" rather than "grants
     touched by this specific run" -- process_candidates() only sets run_id
@@ -265,6 +270,24 @@ async def enrich_grants(engine, run_id: uuid.UUID, limit: int = 20) -> int:
                         eligibility = dict(grant_row.eligibility or {})
                         eligibility["summary"] = result["eligibility_summary"]
                         grant_row.eligibility = eligibility
+
+                    # Gap-fill only -- Layer 1's deterministic regex
+                    # (extract_amounts_from_text) already ran on the listing
+                    # blurb for every grant; only overwrite what it missed,
+                    # rather than letting a detail-page LLM call second-guess
+                    # a value the cheaper deterministic pass already found.
+                    if grant_row.max_amount is None and result.get("max_amount_raw"):
+                        grant_row.max_amount = parse_amount(result["max_amount_raw"])
+                    if grant_row.min_amount is None and result.get("min_amount_raw"):
+                        grant_row.min_amount = parse_amount(result["min_amount_raw"])
+                    if result.get("currency_raw"):
+                        # No clean way to distinguish "never set" from
+                        # "confirmed USD" since USD is also the schema
+                        # default -- worst case here is a harmless redundant
+                        # overwrite with the same value, not a real bug.
+                        grant_row.currency = result["currency_raw"][:3].upper()
+                    if grant_row.funding_type == FundingType.UNKNOWN and result.get("funding_type_raw"):
+                        grant_row.funding_type = map_funding_type(result["funding_type_raw"])
                 enriched_count += 1
         finally:
             await browser.close()

@@ -231,7 +231,7 @@ _FUNDING_TYPE_MAP: dict[str, FundingType] = {
 }
 
 
-def _parse_amount(raw: Optional[str]) -> Optional[Decimal]:
+def parse_amount(raw: Optional[str]) -> Optional[Decimal]:
     if not raw:
         return None
     match = _AMOUNT_RE.search(raw.replace(",", ""))
@@ -254,7 +254,7 @@ def _parse_deadline(raw: Optional[str]) -> Optional[date]:
         return None
 
 
-def _map_funding_type(raw: Optional[str]) -> FundingType:
+def map_funding_type(raw: Optional[str]) -> FundingType:
     if not raw:
         return FundingType.UNKNOWN
     raw_lower = raw.lower()
@@ -276,11 +276,11 @@ def normalize_and_validate(
             grant_name=extracted.grant_name or "",
             funder_name=extracted.funder_name or "",
             description=extracted.description or "",
-            max_amount=_parse_amount(extracted.max_amount_raw),
-            min_amount=_parse_amount(extracted.min_amount_raw),
+            max_amount=parse_amount(extracted.max_amount_raw),
+            min_amount=parse_amount(extracted.min_amount_raw),
             currency=(extracted.currency_raw or "USD")[:3],
             deadline_date=_parse_deadline(extracted.deadline_raw),
-            funding_type=_map_funding_type(extracted.funding_type_raw),
+            funding_type=map_funding_type(extracted.funding_type_raw),
             eligibility=extracted.eligibility or EligibilityCriteria(),
             application_url=extracted.application_url,
             contact_email=extracted.contact_email,
