@@ -34,14 +34,14 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from .extractor import RawListingCandidate, content_hash
+from .extractor import RawListingCandidate, content_hash, extract_amounts_from_text
 from .schemas import (
     ExtractionMethod,
     GrantExtracted,
     SourceMetadata,
     normalize_and_validate,
 )
-from .storage import Grant, GrantHistoryEntry, ValidationErrorRecord
+from .storage import Grant, GrantHistoryEntry, ValidationErrorRecord, session_scope
 
 # Fields worth logging a history entry for when an existing grant changes.
 # Deliberately a small, meaningful set -- not every column (e.g. skipping
@@ -80,11 +80,15 @@ def candidate_to_extracted(
         content_hash=content_hash(hash_input),
         extraction_method=ExtractionMethod.DETERMINISTIC,
     )
+    min_amount_raw, max_amount_raw, currency_raw = extract_amounts_from_text(candidate.description_raw)
     return GrantExtracted(
         grant_name=candidate.grant_name,
         funder_name="Unknown (listing page only — funder not yet extracted)",
         description=candidate.description_raw,
         deadline_raw=candidate.deadline_raw,
+        min_amount_raw=min_amount_raw,
+        max_amount_raw=max_amount_raw,
+        currency_raw=currency_raw,
         application_url=candidate.detail_url,
         source=source,
     )
@@ -187,9 +191,85 @@ def process_candidates(
         existing.min_amount = validated.min_amount
         existing.content_hash = validated.source.content_hash
         existing.last_updated_at = validated.last_updated_at
+        existing.run_id = run_id  # which run last touched this row, for auditability
         stats.updated_grants += 1
 
     return stats
+
+
+async def enrich_grants(engine, run_id: uuid.UUID, limit: int = 20) -> int:
+    """Opt-in Layer 3 pass: fetches detail pages for grants that still carry
+    the placeholder funder_name and uses an LLM to fill in
+    funder_name / application_url / eligibility.
+
+    Deliberately scoped to "grants that still need it" rather than "grants
+    touched by this specific run" -- process_candidates() only sets run_id
+    on brand-new inserts, not on updates, so a run_id-scoped query here
+    would miss both updated grants and the backlog of already-scraped
+    grants that were never enriched. run_id is still accepted (and now
+    recorded on updated grants too, see process_candidates()) for
+    auditability, but no longer used to filter the enrichment target list.
+
+    Deliberately separate from process_candidates() and only run when the
+    caller asks for it (see cli.py's `scrape --enrich`) -- this costs real
+    API calls and real time per grant, so it should never happen silently.
+
+    Returns the count of grants actually enriched (a grant with an
+    unparseable detail page or an LLM failure just keeps its existing data
+    and isn't counted -- see enrich_one_grant()'s never-raises design).
+    """
+    from playwright.async_api import async_playwright
+
+    from .domain_throttle import DomainThrottle
+    from .llm_extractor import enrich_one_grant, get_openrouter_client
+
+    with session_scope(engine) as session:
+        targets = [
+            (g.id, g.grant_name, g.source_url, g.source_domain)
+            for g in session.query(Grant)
+            .filter(Grant.funder_name.like("Unknown%"))
+            .limit(limit)
+            .all()
+        ]
+
+    if not targets:
+        return 0
+
+    client = get_openrouter_client()
+    throttle = DomainThrottle(max_concurrent_per_domain=2, min_delay_seconds=1.5)
+    enriched_count = 0
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        )
+        try:
+            for grant_id, grant_name, source_url, source_domain in targets:
+                async with throttle.throttle(source_domain):
+                    result = await enrich_one_grant(page, client, grant_name, source_url)
+
+                if result is None:
+                    continue
+
+                with session_scope(engine) as session:
+                    grant_row = session.query(Grant).filter_by(id=grant_id).one()
+                    if result.get("funder_name"):
+                        grant_row.funder_name = result["funder_name"]
+                    if result.get("application_url"):
+                        grant_row.application_url = result["application_url"]
+                    if result.get("eligibility_summary"):
+                        eligibility = dict(grant_row.eligibility or {})
+                        eligibility["summary"] = result["eligibility_summary"]
+                        grant_row.eligibility = eligibility
+                enriched_count += 1
+        finally:
+            await browser.close()
+
+    return enriched_count
 
 
 # ---------------------------------------------------------------------------
@@ -198,22 +278,25 @@ def process_candidates(
 
 if __name__ == "__main__":
     from .extractor import parse_listing_page, _FIXTURE_HTML
+    from .sources import SOURCES
     from .storage import get_engine, init_db, session_scope
+
+    fixture_source_config = SOURCES["fundsforngos"]
 
     engine = get_engine("sqlite:///:memory:")
     init_db(engine)
 
     run_id_1 = uuid.uuid4()
     scraped_at_1 = datetime.now().astimezone()
-    candidates = parse_listing_page(_FIXTURE_HTML, "www2.fundsforngos.org")
-    assert len(candidates) == 3
+    candidates, _skipped = parse_listing_page(_FIXTURE_HTML, fixture_source_config)
+    assert len(candidates) == 4
 
     # --- Run 1: everything should be new ---
     with session_scope(engine) as session:
         stats_1 = process_candidates(session, candidates, run_id_1, scraped_at_1)
     print(f"Run 1: new={stats_1.new_grants} updated={stats_1.updated_grants} "
           f"unchanged={stats_1.unchanged_grants} failed={stats_1.validation_failures}")
-    assert stats_1.new_grants == 3
+    assert stats_1.new_grants == 4
     assert stats_1.updated_grants == 0
 
     # --- Run 2: identical candidates again -- everything should be unchanged ---
@@ -224,7 +307,7 @@ if __name__ == "__main__":
     print(f"Run 2 (no changes): new={stats_2.new_grants} updated={stats_2.updated_grants} "
           f"unchanged={stats_2.unchanged_grants} failed={stats_2.validation_failures}")
     assert stats_2.new_grants == 0
-    assert stats_2.unchanged_grants == 3
+    assert stats_2.unchanged_grants == 4
 
     # --- Run 3: one candidate's deadline changed -- should be 1 update + a history entry ---
     changed_candidates = list(candidates)
@@ -243,7 +326,7 @@ if __name__ == "__main__":
     print(f"Run 3 (1 deadline changed): new={stats_3.new_grants} updated={stats_3.updated_grants} "
           f"unchanged={stats_3.unchanged_grants} failed={stats_3.validation_failures}")
     assert stats_3.updated_grants == 1
-    assert stats_3.unchanged_grants == 2
+    assert stats_3.unchanged_grants == 3
 
     with session_scope(engine) as session:
         updated_grant = session.query(Grant).filter_by(source_url=original.detail_url).one()

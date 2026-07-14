@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Accorder — Grant Report</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         margin: 2rem auto; max-width: 900px; color: #1a1a1a; background: #fafafa; padding: 0 1rem; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  .meta { color: #666; margin-bottom: 1.5rem; font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { background: #f0f0f0; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; color: #555; }
+  tr:hover { background: #f7f9fc; }
+  .status { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 3px; font-size: 0.78rem; font-weight: 600; white-space: nowrap; }
+  .status-open { background: #d4f4dd; color: #1a7a3c; }
+  .status-expired { background: #fbdcdc; color: #a12c2c; }
+  .status-rolling { background: #d6ecf7; color: #1a6a8a; }
+  .status-closed { background: #eee; color: #666; }
+  .status-unknown { background: #f0f0f0; color: #888; }
+  .grant-name { font-weight: 600; margin-bottom: 0.2rem; }
+  .grant-name a { color: #1a1a1a; text-decoration: none; }
+  .grant-name a:hover { text-decoration: underline; }
+  .desc { color: #444; font-size: 0.85rem; }
+  .amount { white-space: nowrap; }
+</style>
+</head>
+<body>
+  <h1>Accorder — Grant Report</h1>
+  <div class="meta">{{ total }} grant{{ "s" if total != 1 else "" }} — generated {{ generated_at.strftime("%Y-%m-%d %H:%M UTC") }}</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Deadline</th>
+        <th>Status</th>
+        <th>Grant</th>
+        <th>Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for g in rows %}
+      <tr>
+        <td>{{ g.deadline_date if g.deadline_date else "—" }}</td>
+        <td><span class="status status-{{ g.status }}">{{ g.status }}</span></td>
+        <td>
+          <div class="grant-name"><a href="{{ g.application_url or g.source_url }}" target="_blank" rel="noopener">{{ g.grant_name }}</a></div>
+          <div class="desc">{{ g.description[:160] }}{{ "…" if g.description|length > 160 else "" }}</div>
+        </td>
+        <td class="amount">{% if g.max_amount %}{{ g.currency }} {{ "{:,.0f}".format(g.max_amount) }}{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
